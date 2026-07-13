@@ -23,6 +23,16 @@ CHANGELOG (audit fix):
 - Fix: navigasi utama pindah dari sidebar-button ke st.tabs() di area utama
   -> di Android, sidebar collapsed sering bikin menu "hilang". Tabs selalu
   penuh terlihat baik di desktop maupun mobile.
+- Fix: StreamlitDuplicateElementId. Karena st.tabs() merender SEMUA halaman
+  di setiap rerun (bukan cuma yang lagi dilihat), widget dengan label yang
+  sama di beda halaman (mis. "Channel target") butuh `key` unik eksplisit —
+  tidak bisa lagi mengandalkan auto-generated ID. Semua widget di semua
+  halaman sekarang punya key eksplisit.
+- Fix: sidebar dihapus total. Karena semua halaman render bersamaan lewat
+  tabs, sidebar yang tadinya cuma dipakai 1 halaman (Search Instant) akan
+  membingungkan kalau dibiarkan (opsi scan "bocor" ke tab lain). Semua opsi
+  scan sekarang inline di body tab masing-masing, konsisten dengan
+  page_index/page_age/page_chat yang dari awal begitu.
 """
 
 import html
@@ -529,7 +539,8 @@ def page_setup(gate: bool = False):
         if os.path.exists(CONFIG_JSON):
             with open(CONFIG_JSON, "rb") as f:
                 st.download_button("⬇️ Download config.json saat ini", f.read(),
-                                    "config.json", mime="application/json")
+                                    "config.json", mime="application/json",
+                                    key="settings_download_config_btn")
         else:
             st.caption("Belum ada config.json tersimpan.")
 
@@ -559,72 +570,87 @@ def page_search(cfg: dict):
     st.title("🔍 Search Instant")
     st.caption("Mode Pantau: video paralel per channel, channel diproses sequential FIFO.")
 
-    with st.sidebar:
-        st.markdown("### ⚙️ Opsi Scan")
-        executor = st.text_input("Nama alias", value=st.session_state.get("executor", ""))
-        st.session_state.executor = executor
-
-        lang_choice = st.selectbox("Bahasa engine", options=list(LANG_OPTIONS.keys()),
-                                    format_func=lambda k: LANG_OPTIONS[k])
-        content_type = st.selectbox("Tipe konten", options=list(CONTENT_TYPE_OPTIONS.keys()),
-                                     format_func=lambda k: CONTENT_TYPE_OPTIONS[k])
-        video_limit = st.number_input(
-            "Maks video per channel", min_value=1, max_value=5000, value=50, step=10,
-            help="Channel dengan video >1000 sebaiknya pakai Index Mode, bukan Search Instant."
-        )
-        jobs = st.slider("Workers (thread)", 1, 8, 4,
-                          help="Lebih banyak = lebih cepat tapi lebih boros RAM. HP kentang pakai 2.")
-
-        st.divider()
-        st.markdown("### 📺 Tambah Channel")
-        disabled_add = st.session_state.running or st.session_state.session_done
-        new_handle = st.text_input("Username channel (tanpa @)", key="new_channel_input",
-                                    disabled=disabled_add)
-        if st.button("➕ Tambah ke antrian", use_container_width=True, disabled=disabled_add):
-            handle_clean = new_handle.strip().lstrip("@")
-            if not handle_clean:
-                st.warning("⚠️ Isi username channel dulu.")
-            elif any(c["handle"].lower() == handle_clean.lower() for c in st.session_state.channels):
-                st.warning(f"⚠️ @{handle_clean} sudah ada di antrian.")
-            else:
-                with st.spinner(f"Memeriksa @{handle_clean}..."):
-                    res = validate_channel(handle_clean, content_type)
-                st.session_state.channels.append({
-                    "handle": handle_clean,
-                    "name": res["name"],
-                    "valid": res["valid"],
-                    "error": res["error"],
-                    "status": "queued",
-                })
-                save_queue(st.session_state.channels)
-                st.rerun()
-
-        if st.session_state.channels:
-            st.markdown("#### Antrian channel")
-            for i, ch in enumerate(st.session_state.channels):
-                badge = "✅" if ch["valid"] else "❌"
-                status = ch.get("status", "queued")
-                status_icon = {"queued": "⏳", "done": "🏁", "running": "▶️"}.get(status, status)
-                label = ch["name"] if ch["valid"] else (ch["error"] or "invalid")
-                colc1, colc2 = st.columns([5, 1])
-                with colc1:
-                    st.write(f"{badge} **@{ch['handle']}** — {label}  `{status_icon} {status}`")
-                with colc2:
-                    if st.button("🗑", key=f"del_{i}", disabled=st.session_state.running):
-                        st.session_state.channels.pop(i)
-                        save_queue(st.session_state.channels)
-                        st.rerun()
-
     st.session_state.theme = st.radio("Tema", ["dark", "light"], horizontal=True,
                                        index=0 if st.session_state.theme == "dark" else 1,
                                        key="theme_radio_search")
     inject_theme_css(st.session_state.theme)
 
+    # ── Semua opsi scan ditaruh di body (bukan sidebar) supaya tetap terlihat
+    # tanpa perlu buka panel collapsible — penting untuk layar sempit/Android. ──
+    st.markdown("### ⚙️ Opsi Scan")
+    oc1, oc2 = st.columns(2)
+    with oc1:
+        executor = st.text_input("Nama alias", value=st.session_state.get("executor", ""),
+                                  key="search_executor")
+        st.session_state.executor = executor
+        lang_choice = st.selectbox("Bahasa engine", options=list(LANG_OPTIONS.keys()),
+                                    format_func=lambda k: LANG_OPTIONS[k], key="search_lang")
+    with oc2:
+        content_type = st.selectbox("Tipe konten", options=list(CONTENT_TYPE_OPTIONS.keys()),
+                                     format_func=lambda k: CONTENT_TYPE_OPTIONS[k], key="search_ct")
+        video_limit = st.number_input(
+            "Maks video per channel", min_value=1, max_value=5000, value=50, step=10,
+            help="Channel dengan video >1000 sebaiknya pakai Index Mode, bukan Search Instant.",
+            key="search_video_limit"
+        )
+    jobs = st.slider("Workers (thread)", 1, 8, 4,
+                      help="Lebih banyak = lebih cepat tapi lebih boros RAM. HP kentang pakai 2.",
+                      key="search_jobs")
+
+    st.divider()
+    st.markdown("### 📺 Tambah Channel")
+    disabled_add = st.session_state.running or st.session_state.session_done
+    add_col1, add_col2 = st.columns([4, 1])
+    with add_col1:
+        new_handle = st.text_input("Username channel (tanpa @)", key="new_channel_input",
+                                    disabled=disabled_add, label_visibility="collapsed",
+                                    placeholder="Username channel (tanpa @)")
+    with add_col2:
+        add_clicked = st.button("➕ Tambah", use_container_width=True,
+                                 disabled=disabled_add, key="search_add_channel_btn")
+    if add_clicked:
+        handle_clean = new_handle.strip().lstrip("@")
+        if not handle_clean:
+            st.warning("⚠️ Isi username channel dulu.")
+        elif any(c["handle"].lower() == handle_clean.lower() for c in st.session_state.channels):
+            st.warning(f"⚠️ @{handle_clean} sudah ada di antrian.")
+        else:
+            with st.spinner(f"Memeriksa @{handle_clean}..."):
+                res = validate_channel(handle_clean, content_type)
+            st.session_state.channels.append({
+                "handle": handle_clean,
+                "name": res["name"],
+                "valid": res["valid"],
+                "error": res["error"],
+                "status": "queued",
+            })
+            save_queue(st.session_state.channels)
+            st.rerun()
+
+    if st.session_state.channels:
+        st.markdown("#### Antrian channel")
+        for i, ch in enumerate(st.session_state.channels):
+            badge = "✅" if ch["valid"] else "❌"
+            status = ch.get("status", "queued")
+            status_icon = {"queued": "⏳", "done": "🏁", "running": "▶️"}.get(status, status)
+            label = ch["name"] if ch["valid"] else (ch["error"] or "invalid")
+            colc1, colc2 = st.columns([5, 1])
+            with colc1:
+                st.write(f"{badge} **@{ch['handle']}** — {label}  `{status_icon} {status}`")
+            with colc2:
+                if st.button("🗑", key=f"search_del_{i}", disabled=st.session_state.running):
+                    st.session_state.channels.pop(i)
+                    save_queue(st.session_state.channels)
+                    st.rerun()
+
+    st.divider()
+
     # ── Gate: kalau sesi sebelumnya sudah selesai, wajib "Mulai Sesi Baru" dulu ──
     if st.session_state.session_done:
         st.success("🏁 Sesi scan sebelumnya sudah selesai.")
         st.caption("Antrian channel & hasil scan sesi lalu masih ditampilkan di bawah untuk referensi.")
-        if st.button("🔄 Mulai Sesi Baru", type="primary", use_container_width=True):
+        if st.button("🔄 Mulai Sesi Baru", type="primary", use_container_width=True,
+                      key="search_new_session_btn"):
             clear_queue()
             st.session_state.search_results_tmp = []
             st.session_state.session_done = False
@@ -639,14 +665,14 @@ def page_search(cfg: dict):
     start_col, info_col = st.columns([1, 4])
     with start_col:
         start_clicked = st.button("▶️ Mulai Scan", type="primary", use_container_width=True,
-                                   disabled=start_disabled)
+                                   disabled=start_disabled, key="search_start_btn")
     with info_col:
         if st.session_state.session_done:
             st.caption("ℹ️ Tekan 'Mulai Sesi Baru' dulu di atas sebelum bisa scan lagi.")
         elif not executor.strip():
-            st.caption("⚠️ Isi nama alias dulu di sidebar.")
+            st.caption("⚠️ Isi nama alias dulu di atas.")
         elif not valid_channels:
-            st.caption("⚠️ Tambahkan minimal 1 channel valid ke antrian (sidebar).")
+            st.caption("⚠️ Tambahkan minimal 1 channel valid ke antrian di atas.")
 
     if start_clicked and not start_disabled:
         st.session_state.running = True
@@ -692,21 +718,22 @@ def page_index(cfg: dict):
         "otomatis sampai habis) supaya kamu tetap kontrol beban & bisa jeda kapan saja."
     )
 
-    channel = st.text_input("📺 Channel target", placeholder="nama_channel").strip().lstrip("@")
+    channel = st.text_input("📺 Channel target", placeholder="nama_channel",
+                             key="idx_channel").strip().lstrip("@")
 
     st.subheader("⚙️ Konfigurasi Batch")
     col1, col2 = st.columns(2)
     with col1:
-        total_videos = st.number_input("Total video estimasi", min_value=10, value=1000)
-        batch_size = st.number_input("Video per batch", min_value=10, max_value=500, value=100)
+        total_videos = st.number_input("Total video estimasi", min_value=10, value=1000, key="idx_total_videos")
+        batch_size = st.number_input("Video per batch", min_value=10, max_value=500, value=100, key="idx_batch_size")
     with col2:
-        jobs = st.slider("Workers", 1, 3, 2)
+        jobs = st.slider("Workers", 1, 3, 2, key="idx_jobs")
         content_type = st.selectbox("Tipe konten", options=list(CONTENT_TYPE_OPTIONS.keys()),
                                      format_func=lambda k: CONTENT_TYPE_OPTIONS[k], key="idx_ct")
     lang_choice = st.selectbox("Bahasa engine", options=list(LANG_OPTIONS.keys()),
                                 format_func=lambda k: LANG_OPTIONS[k], key="idx_lang")
 
-    if channel and st.button("✅ Validasi Channel"):
+    if channel and st.button("✅ Validasi Channel", key="idx_validate_btn"):
         with st.spinner("Validasi..."):
             info = validate_channel(channel, content_type)  # fix: pakai content_type yg sama dgn run
         if info["valid"]:
@@ -720,14 +747,17 @@ def page_index(cfg: dict):
 
     batches_per_run = st.number_input(
         "Batch diproses per klik run", min_value=1, max_value=int(total_batches), value=min(2, int(total_batches)),
-        help="Setiap klik run cuma proses sekian batch — sisanya lanjut di klik run berikutnya (resume otomatis)."
+        help="Setiap klik run cuma proses sekian batch — sisanya lanjut di klik run berikutnya (resume otomatis).",
+        key="idx_batches_per_run"
     )
-    start_batch = st.number_input("Mulai dari batch ke-", min_value=1, max_value=int(total_batches), value=1)
+    start_batch = st.number_input("Mulai dari batch ke-", min_value=1, max_value=int(total_batches), value=1,
+                                   key="idx_start_batch")
 
     executor = st.text_input("👤 Nama alias", value=cfg.get("executor", ""), key="idx_executor")
 
     run_disabled = not channel or st.session_state.get("index_running", False)
-    if st.button("🚀 Proses Batch Ini", type="primary", use_container_width=True, disabled=run_disabled):
+    if st.button("🚀 Proses Batch Ini", type="primary", use_container_width=True, disabled=run_disabled,
+                 key="idx_run_btn"):
         webhook_url = cfg.get("webhooks", {}).get(lang_choice, "")
         cmd = [
             sys.executable, ENGINE_INDEX,
@@ -767,16 +797,18 @@ def page_age(cfg: dict):
     else:
         st.error("❌ cookies.txt belum di-upload. Buka Settings → tab Cookies dulu.")
 
-    channel = st.text_input("📺 Channel target (wajib)", placeholder="nama_channel").strip().lstrip("@")
+    channel = st.text_input("📺 Channel target (wajib)", placeholder="nama_channel",
+                             key="age_channel").strip().lstrip("@")
 
     col1, col2 = st.columns(2)
     with col1:
         content_type = st.selectbox("Tipe konten", options=list(CONTENT_TYPE_OPTIONS.keys()),
                                      format_func=lambda k: CONTENT_TYPE_OPTIONS[k], key="age_ct")
-        limit = st.number_input("Jumlah video terakhir", min_value=1, value=50)
+        limit = st.number_input("Jumlah video terakhir", min_value=1, value=50, key="age_limit")
     with col2:
         jobs = st.select_slider("Kecepatan (worker)", options=[1, 2, 3, 4], value=2,
-                                 help="1=paling aman utk cookies, 4=paling cepat tapi rawan rate limit")
+                                 help="1=paling aman utk cookies, 4=paling cepat tapi rawan rate limit",
+                                 key="age_jobs")
         lang_choice = st.selectbox("Bahasa engine", options=list(LANG_OPTIONS.keys()),
                                     format_func=lambda k: LANG_OPTIONS[k], key="age_lang")
 
@@ -789,7 +821,8 @@ def page_age(cfg: dict):
 
     run_disabled = (not channel or not os.path.exists(COOKIES_PATH)
                      or st.session_state.get("age_running", False))
-    if st.button("🔞 Mulai Age Bypass", type="primary", use_container_width=True, disabled=run_disabled):
+    if st.button("🔞 Mulai Age Bypass", type="primary", use_container_width=True, disabled=run_disabled,
+                 key="age_start_btn"):
         webhook_url = cfg.get("webhooks", {}).get(lang_choice, "")
         cmd = [
             sys.executable, ENGINE_AGE,
@@ -827,15 +860,17 @@ def page_chat(cfg: dict):
     st.title("💬 ChatSeeker")
     st.caption("Mining live chat replay — cari keyword cegukan di chat arsip livestream.")
 
-    channel = st.text_input("📺 Channel target", placeholder="nama_channel").strip().lstrip("@")
+    channel = st.text_input("📺 Channel target", placeholder="nama_channel",
+                             key="chat_channel").strip().lstrip("@")
 
     col1, col2 = st.columns(2)
     with col1:
         filter_mode = st.selectbox("Mode filter", options=list(FILTER_OPTIONS.keys()),
-                                    format_func=lambda k: FILTER_OPTIONS[k])
+                                    format_func=lambda k: FILTER_OPTIONS[k], key="chat_filter_mode")
         max_vid_input = "ALL"
         if filter_mode in ("LIMIT", "LIMIT_CHECKPOINT"):
-            max_vid_input = str(st.number_input("Jumlah video terbaru", min_value=1, value=50))
+            max_vid_input = str(st.number_input("Jumlah video terbaru", min_value=1, value=50,
+                                                  key="chat_max_vid"))
     with col2:
         webhook_lang = st.selectbox("Kirim laporan ke webhook", options=list(LANG_OPTIONS.keys()),
                                      format_func=lambda k: LANG_OPTIONS[k], key="chat_webhook_lang")
@@ -850,7 +885,8 @@ def page_chat(cfg: dict):
     )
 
     run_disabled = not channel or st.session_state.get("chat_running", False)
-    if st.button("💬 Mulai ChatSeeker", type="primary", use_container_width=True, disabled=run_disabled):
+    if st.button("💬 Mulai ChatSeeker", type="primary", use_container_width=True, disabled=run_disabled,
+                 key="chat_start_btn"):
         webhook_url = cfg.get("webhooks", {}).get(webhook_lang, "")
         cmd = [
             sys.executable, ENGINE_CHAT,
@@ -872,17 +908,18 @@ def page_chat(cfg: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MAIN — navigasi pakai st.tabs() di area utama, BUKAN sidebar button.
-# Alasan: di Android, sidebar Streamlit default collapsed dan ikon buka (>>)
-# gampang ke-cover / meleset di layar sempit -> menu "hilang". st.tabs()
-# selalu terlihat penuh baik di desktop maupun mobile.
+# MAIN — navigasi pakai st.tabs() di area utama. Sidebar TIDAK dipakai sama
+# sekali (dihapus): di Android, sidebar Streamlit default collapsed dan ikon
+# buka (>>) gampang ke-cover / meleset di layar sempit -> menu "hilang".
+# st.tabs() selalu terlihat penuh baik di desktop maupun mobile, dan karena
+# semua halaman render bersamaan, menaruh opsi di sidebar bikin opsi 1
+# halaman "bocor" terlihat di halaman lain -> semua opsi ditaruh di body.
 # ══════════════════════════════════════════════════════════════════════════
 def main():
     st.set_page_config(
         page_title="Cegukan Seeker V20 — Web UI",
         page_icon="👑",
         layout="wide",
-        initial_sidebar_state="expanded",
     )
 
     cfg = get_cfg()
