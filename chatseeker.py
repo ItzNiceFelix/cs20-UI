@@ -5,6 +5,7 @@
 #   Rewrite dari chatseeker.sh V2.1 + adaptasi error engine dari cs20_age_engine
 # ==============================================================================
 
+import argparse
 import gc
 import json
 import os
@@ -45,7 +46,10 @@ except ImportError:
 # ==============================================================================
 # KONFIGURASI — edit di sini
 # ==============================================================================
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1465401345648496640/lzk0AuBOVTOib4R3sU7AQSebuIfVTkUBnTJSDhIKBRJhQranES4AnEXcJfMCJzT1Kcdk"
+# SECURITY FIX: webhook TIDAK di-hardcode lagi (konsisten dengan cs20_engine.py,
+# cs20_index_engine.py, cs20_age_engine.py). Diisi lewat --webhook-url (mode CLI
+# non-interaktif / Web UI) atau di-prompt manual di mode interaktif lama (lihat main()).
+DISCORD_WEBHOOK = ""
 LOG_FILE        = Path(".chatseeker_log.json")
 CHECKPOINT_DIR  = Path(".cs_checkpoints")
 WORKERS         = 4          # paralel download
@@ -67,6 +71,19 @@ _BAR_W        = max(8, min(20, _TERM_W - 38))
 _console      = Console(highlight=False)
 _stats_lock   = threading.Lock()
 _html_lock    = threading.Lock()
+
+# ==============================================================================
+# JSON EVENTS (untuk Web UI / Streamlit) — konsisten dengan cs20_engine.py,
+# cs20_index_engine.py, cs20_age_engine.py. Saat --json-events aktif, engine
+# print event JSON per baris (prefix "CS20JSON:") ke stdout, dan SEMUA prompt
+# interaktif (Confirm.ask/Prompt.ask) di-skip otomatis dengan default aman —
+# subprocess dari Streamlit tidak attached ke terminal interaktif.
+# ==============================================================================
+JSON_MODE: bool = False
+
+def _emit_json(event_type: str, payload: dict):
+    line = {"type": event_type, **payload}
+    print("CS20JSON:" + json.dumps(line, ensure_ascii=False), flush=True)
 
 # Stats real-time (diupdate dari thread)
 _stats = {
@@ -680,7 +697,8 @@ def _send_discord(
     html_path: Path | None = None,
     partial: bool = False,
 ):
-    if not DISCORD_WEBHOOK:
+    webhook_url = DISCORD_WEBHOOK
+    if not webhook_url:
         return
 
     total_hits = t4 + t3 + t2 + t1
@@ -714,7 +732,7 @@ def _send_discord(
             *cmd_base,
             "-F", f"payload_json={payload_str}",
             "-F", f"file=@{html_path}",
-            DISCORD_WEBHOOK,
+            webhook_url,
         ]
     else:
         cmd = [
@@ -722,11 +740,16 @@ def _send_discord(
             "-H", "Content-Type: application/json",
             "-X", "POST",
             "-d", payload_str,
-            DISCORD_WEBHOOK,
+            webhook_url,
         ]
 
     try:
         subprocess.run(cmd, timeout=30, capture_output=True)
+        if JSON_MODE:
+            _emit_json("report_sent", {
+                "channel": target,
+                "html_path": str(html_path) if html_path else "",
+            })
     except Exception:
         pass
 
@@ -868,6 +891,10 @@ def run_forensik_engine(
             _console.print(
                 "  [yellow][i] Semua video sudah pernah diproses.[/yellow]"
             )
+            if JSON_MODE:
+                # Non-interaktif: jangan reset checkpoint otomatis, cukup stop.
+                _console.print("  [dim](JSON mode — checkpoint tidak direset otomatis)[/dim]")
+                return False
             reset = Confirm.ask("  Reset checkpoint dan mulai ulang?", default=False)
             if reset:
                 _reset_checkpoint(target)
@@ -987,6 +1014,12 @@ def run_forensik_engine(
                 layout["progress"].update(progress_dl)
                 live.refresh()
 
+                if JSON_MODE:
+                    _emit_json("progress", {
+                        "phase": "dl", "channel": target,
+                        "done": _stats["done"], "total": _stats["total"],
+                    })
+
                 # Rate limit guard: 10 berturut → cooldown, bukan shutdown
                 if consecutive_rl >= 10:
                     live.stop()
@@ -994,6 +1027,11 @@ def run_forensik_engine(
                         f"\n[yellow][⚠] {consecutive_rl}× rate limit berturut — "
                         f"cooldown 90 detik...[/yellow]"
                     )
+                    if JSON_MODE:
+                        _emit_json("cooldown", {
+                            "channel": target, "seconds": 90,
+                            "reason": "rate_limit_consecutive",
+                        })
                     time.sleep(90)
                     consecutive_rl = 0
                     live.start()
@@ -1078,6 +1116,24 @@ def run_forensik_engine(
                 layout2["progress"].update(progress_parse)
                 live2.refresh()
 
+                if JSON_MODE:
+                    _emit_json("progress", {
+                        "phase": "parse", "channel": target,
+                        "done": _stats["done"], "total": _stats["total"],
+                    })
+                    if level > 0:
+                        _emit_json("match", {
+                            "channel": target,
+                            "video_id": vid_id,
+                            "title": vid_id,
+                            "level": level,
+                            "score": score,
+                            "hits": [
+                                {"time": h["ts"], "text": h["text"], "url": h["url"]}
+                                for h in res.get("hits", [])
+                            ],
+                        })
+
     # ══════════════════════════════════════════════════════════════════════════
     # KALKULASI FINAL
     # ══════════════════════════════════════════════════════════════════════════
@@ -1151,7 +1207,7 @@ def run_forensik_engine(
             width=_PANEL_W,
         ))
 
-        do_retry = Confirm.ask(
+        do_retry = True if JSON_MODE else Confirm.ask(
             f"  Retry {len(retryable)} video yang gagal sekarang?",
             default=True,
         )
@@ -1557,5 +1613,46 @@ def main():
 
 
 # ==============================================================================
+# ENTRY POINT
+# ==============================================================================
+# Dua mode:
+#  1. TANPA --channel  → mode interaktif lama (main()), 100% tidak berubah.
+#  2. DENGAN --channel → mode non-interaktif (dipakai Web UI / CLI langsung),
+#     skip semua Prompt.ask/Confirm.ask, jalankan run_forensik_engine() langsung.
+#     --json-events aktifkan print event JSON (prefix CS20JSON:) buat Web UI.
+# ==============================================================================
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="ChatSeeker V3.0 — Live Chat Miner")
+    parser.add_argument("--channel",        default="",
+                         help="Kalau diisi, jalankan mode non-interaktif langsung.")
+    parser.add_argument("--executor",       default="Unknown")
+    parser.add_argument("--filter",         default="ALL",
+                         choices=["ALL", "LIMIT", "CHECKPOINT", "LIMIT_CHECKPOINT"])
+    parser.add_argument("--max-vid",        default="ALL",
+                         help="Jumlah video maksimal (integer) atau 'ALL'.")
+    parser.add_argument("--webhook-url",    default="")
+    parser.add_argument("--checkpoint-dir", default=".cs_checkpoints")
+    parser.add_argument("--json-events",    action="store_true",
+                         help="Print event JSON (prefix CS20JSON:) buat konsumsi Web UI. "
+                              "Otomatis skip semua prompt interaktif dengan default aman.")
+
+    args = parser.parse_args()
+
+    if args.channel:
+        # ── Mode non-interaktif ──────────────────────────────────────────
+        JSON_MODE       = args.json_events
+        DISCORD_WEBHOOK = args.webhook_url
+        CHECKPOINT_DIR  = Path(args.checkpoint_dir)
+        _operator_name  = args.executor
+
+        max_vid = args.max_vid if args.max_vid == "ALL" else int(args.max_vid)
+
+        ok = run_forensik_engine(args.channel.lstrip("@"), args.filter, max_vid)
+
+        if JSON_MODE:
+            _emit_json("all_done", {"channel": args.channel, "success": ok})
+
+        sys.exit(0 if ok else 1)
+    else:
+        # ── Mode interaktif lama — perilaku 100% sama seperti sebelumnya ──
+        main()
