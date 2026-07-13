@@ -161,37 +161,55 @@ def run_ytdlp(args: list, timeout: int = 60) -> tuple[int, str, str]:
     except FileNotFoundError:
         return -1, "", "yt-dlp not found"
 
-def validate_channel(channel: str) -> dict | None:
+def validate_channel(channel: str, content_type: str = "all") -> dict | None:
+    """
+    content_type: "video" -> cuma cek tab /videos
+                  "live"  -> cuma cek tab /streams
+                  "all"   -> cek keduanya (default, kompatibel dgn caller lama)
+    """
     ch = channel.lstrip("@").strip()
     if not ch:
         return None
 
-    rc, out, err = run_ytdlp([
-        "--print", "channel",
-        "--print", "uploader_id",
-        "--playlist-items", "0",
-        "--no-warnings", "--quiet",
-        f"https://www.youtube.com/@{ch}/videos"
-    ], timeout=15)
+    check_videos = content_type in ("all", "video")
+    check_live   = content_type in ("all", "live")
 
-    name = None
-    if rc == 0 and out.strip():
-        lines = out.strip().splitlines()
-        name = lines[0].strip() if lines else ch
+    # Tab utama buat ambil nama channel: ikut pilihan content_type dulu,
+    # baru fallback ke tab satunya kalau gagal (nama doang, harmless
+    # dicoba dua-duanya walau content_type spesifik).
+    primary_tab   = "streams" if content_type == "live" else "videos"
+    fallback_tab  = "videos" if primary_tab == "streams" else "streams"
 
-    rc2, out2, _ = run_ytdlp([
-        "--flat-playlist", "--print", "playlist_count",
-        "--playlist-items", "0", "--no-warnings", "--quiet",
-        f"https://www.youtube.com/@{ch}/videos"
-    ], timeout=15)
-    video_count = int(out2.strip()) if rc2 == 0 and out2.strip().isdigit() else 0
+    def _fetch_name(tab: str):
+        rc, out, _ = run_ytdlp([
+            "--print", "channel",
+            "--playlist-items", "1",
+            "--no-warnings", "--quiet",
+            f"https://www.youtube.com/@{ch}/{tab}"
+        ], timeout=15)
+        if rc == 0 and out.strip():
+            return out.strip().splitlines()[0].strip()
+        return None
 
-    rc3, out3, _ = run_ytdlp([
-        "--flat-playlist", "--print", "playlist_count",
-        "--playlist-items", "0", "--no-warnings", "--quiet",
-        f"https://www.youtube.com/@{ch}/streams"
-    ], timeout=15)
-    live_count = int(out3.strip()) if rc3 == 0 and out3.strip().isdigit() else 0
+    name = _fetch_name(primary_tab) or _fetch_name(fallback_tab)
+
+    video_count = 0
+    if check_videos:
+        rc2, out2, _ = run_ytdlp([
+            "--flat-playlist", "--print", "playlist_count",
+            "--playlist-items", "0", "--no-warnings", "--quiet",
+            f"https://www.youtube.com/@{ch}/videos"
+        ], timeout=15)
+        video_count = int(out2.strip()) if rc2 == 0 and out2.strip().isdigit() else 0
+
+    live_count = 0
+    if check_live:
+        rc3, out3, _ = run_ytdlp([
+            "--flat-playlist", "--print", "playlist_count",
+            "--playlist-items", "0", "--no-warnings", "--quiet",
+            f"https://www.youtube.com/@{ch}/streams"
+        ], timeout=15)
+        live_count = int(out3.strip()) if rc3 == 0 and out3.strip().isdigit() else 0
 
     return {
         "username": ch,
@@ -581,7 +599,7 @@ def page_search():
         if channels and st.button("✅ Validasi Channel", type="secondary"):
             with st.spinner("Validasi channel..."):
                 for ch in channels:
-                    info = validate_channel(ch)
+                    info = validate_channel(ch, content_type_code)
                     st.session_state.channels_validated[ch] = info
                     if info and info["valid"]:
                         st.success(f"✅ @{ch} → **{info['name']}** | Video: {info['video_count']:,} | Live: {info['live_count']:,}")
@@ -911,7 +929,7 @@ def page_chat():
     if channel:
         if st.button("✅ Validasi"):
             with st.spinner("Validasi..."):
-                info = validate_channel(channel)
+                info = validate_channel(channel, "live")
                 if info and info["valid"]:
                     st.success(f"✅ **{info['name']}** | Live: {info['live_count']:,}")
                 else:
