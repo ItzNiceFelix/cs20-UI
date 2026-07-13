@@ -1,13 +1,20 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ==============================================================================
 # INSTALL DEPS — Cegukan Seeker V20 Streamlit
-# Ringan, tanpa compile berat
+#
+# Pendekatan: BUKAN nebak nama modul satu-satu (rawan ketinggalan —
+# itu penyebab error blinker/typing_extensions dkk sebelumnya). Sebaliknya,
+# biarkan pip resolve dependency Streamlit SECARA PENUH & OTOMATIS (dia yang
+# paling tau versi persis yang dibutuhkan), dan kita cuma "akalin" 2 paket
+# yang MEMANG berat/compile (pyarrow, pydeck) dengan stub kosong — karena
+# app CS20 UI ini tidak pernah pakai st.dataframe / st.pydeck_chart sama
+# sekali, jadi keduanya aman di-stub tanpa fungsi apapun.
 # ==============================================================================
 
 set -e
 
 echo "================================================================"
-echo "  🚀 CS20 STREAMLIT — LIGHTWEIGHT INSTALLER"
+echo "  🚀 CS20 STREAMLIT — INSTALLER"
 echo "================================================================"
 echo ""
 
@@ -18,11 +25,10 @@ pkg install -y python rust binutils || {
     exit 1
 }
 
-# ── 1b. Health-check pip (deteksi shebang python rusak) ──────────
+# ── 1b. Health-check pip ──────────────────────────────────────────
 echo "🔍 [1b/6] Cek kesehatan pip..."
 if ! pip --version >/dev/null 2>&1; then
     echo "⚠️  pip rusak (biasanya shebang nunjuk ke Python versi lama)."
-    echo "    Mencoba perbaikan otomatis via ensurepip..."
     python3 -m ensurepip --upgrade || {
         echo "❌ Gagal perbaiki pip otomatis. Coba manual:"
         echo "     pkg uninstall python -y && pkg install python -y"
@@ -32,65 +38,77 @@ if ! pip --version >/dev/null 2>&1; then
 fi
 echo "  ✓ pip OK: $(pip --version)"
 
-# ── 2. Streamlit (no heavy deps) ──────────────────────────────
-echo "📦 [2/6] Installing Streamlit (no deps)..."
-pip install streamlit --no-deps --break-system-packages || {
-    echo "❌ Gagal install Streamlit"
+# ── 2. numpy & pandas via pkg — PREBUILT, harus duluan ────────────
+# Streamlit butuh keduanya di runtime (bukan cuma dataframe display —
+# beberapa modul internal Streamlit import numpy/pandas di top-level).
+# Pasang via pkg (Termux repo, sudah dikompilasi) SEBELUM pip install
+# streamlit, supaya nanti pip resolver lihat keduanya "sudah terpenuhi"
+# dan tidak coba compile dari source sendiri.
+echo "📦 [2/6] Installing numpy/pandas (prebuilt via pkg)..."
+pkg install -y python-numpy python-pandas || {
+    echo "⚠️  Gagal install numpy/pandas via pkg — lanjut, tapi kemungkinan"
+    echo "    pip nanti akan coba compile dari source (lama)."
+}
+
+# ── 3. Stub pyarrow & pydeck — TIDAK dipakai app ini sama sekali ──
+# Keduanya wajib menurut metadata Streamlit tapi butuh compile berat
+# (pyarrow: C++/Arrow; pydeck: narik numpy versi tertentu + build JS).
+# App CS20 UI tidak pernah panggil st.dataframe/st.table/st.pydeck_chart,
+# jadi stub kosong (modul valid, tidak melakukan apa-apa) cukup untuk
+# memenuhi pip resolver tanpa compile sama sekali.
+echo "📦 [3/6] Membuat stub pyarrow & pydeck (tidak dipakai app ini)..."
+STUB_DIR="$(mktemp -d)"
+
+make_stub () {
+    local name="$1" version="$2" dir="$STUB_DIR/$name"
+    mkdir -p "$dir/$name"
+    cat > "$dir/pyproject.toml" <<EOF
+[project]
+name = "$name"
+version = "$version"
+description = "Stub — CS20 UI tidak menggunakan modul ini"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+EOF
+    cat > "$dir/$name/__init__.py" <<EOF
+# Stub kosong — CS20 UI tidak menggunakan modul ini (tidak ada
+# st.dataframe / st.pydeck_chart dsb). Dibuat hanya supaya pip
+# dependency resolver Streamlit terpenuhi tanpa compile berat.
+__version__ = "$version"
+EOF
+    pip install "$dir" --break-system-packages -q 2>&1 | tail -3
+}
+
+python3 -c "import pyarrow" >/dev/null 2>&1 || make_stub pyarrow 14.0.2
+python3 -c "import pydeck"  >/dev/null 2>&1 || make_stub pydeck  0.9.1
+rm -rf "$STUB_DIR"
+
+# ── 4. Streamlit — biarkan pip resolve SEMUA dependency-nya sendiri ──
+# Ini kuncinya: bukan kita tebak paket satu-satu (blinker, click,
+# typing_extensions, packaging, dst — daftar ini gampang kurang),
+# tapi pip yang tau persis versi & daftar lengkap yang benar.
+echo "📦 [4/6] Installing Streamlit (resolve dependency otomatis)..."
+pip install streamlit --break-system-packages || {
+    echo "❌ Gagal install Streamlit. Kemungkinan masih ada paket berat"
+    echo "   yang coba di-compile. Cek pesan error di atas — nama paket"
+    echo "   yang gagal biasanya kelihatan jelas di baris 'Building wheel for ...'"
     exit 1
 }
 
-# ── 3. Pure-Python deps — SATU-SATU (biar gagalnya spesifik) ──────
-# PENTING: pip install grup itu ATOMIC — kalau 1 paket gagal, SEMUA
-# paket di command yang sama batal terinstall, walau di-wrap "|| echo
-# warning" (makanya sebelumnya blinker dkk raib tanpa kelihatan error
-# jelas). Install satu-satu supaya kegagalan per-paket kelihatan.
-echo "📦 [3/6] Installing pure-Python dependencies (satu per satu)..."
-PKGS_CORE=(
-    click blinker cachetools protobuf tornado altair
-    gitpython pillow requests rich tenacity toml
-    watchdog validators
-    anyio itsdangerous python-multipart starlette
-    uvicorn websockets httptools
-)
-FAILED_PKGS=()
-for pkg in "${PKGS_CORE[@]}"; do
-    echo "   → $pkg"
-    if ! pip install "$pkg" --break-system-packages -q; then
-        echo "   ⚠️  GAGAL: $pkg"
-        FAILED_PKGS+=("$pkg")
-    fi
-done
-
-if [ ${#FAILED_PKGS[@]} -gt 0 ]; then
-    echo ""
-    echo "⚠️  Paket berikut gagal ke-install: ${FAILED_PKGS[*]}"
-    echo "    Coba install manual satu-satu untuk lihat error detailnya:"
-    for p in "${FAILED_PKGS[@]}"; do
-        echo "      pip install $p --break-system-packages"
-    done
-fi
-
-# ── 4. numpy/pandas via pkg (prebuilt!) ────────────────────────
-echo "📦 [4/6] Installing numpy/pandas (prebuilt)..."
-pkg install -y python-numpy python-pandas || {
-    echo "⚠️  Gagal install numpy/pandas via pkg"
-}
-
-# ── 5. Engine deps ─────────────────────────────────────────────
-echo "📦 [5/6] Installing engine dependencies..."
-pip install youtube-transcript-api yt-dlp \
+# ── 5. Engine deps ─────────────────────────────────────────────────
+echo "📦 [5/6] Installing engine dependencies (yt-dlp, transcript API, rich)..."
+pip install youtube-transcript-api yt-dlp rich requests \
     --break-system-packages || {
     echo "❌ Gagal install engine deps"
     exit 1
 }
 
-# ── 6. VERIFIKASI — cek beneran bisa di-import, bukan cuma "install selesai" ──
+# ── 6. VERIFIKASI — import beneran, bukan cuma "pip bilang sukses" ──
 echo "🔍 [6/6] Verifikasi modul (import test)..."
 VERIFY_MODULES=(
-    streamlit click blinker cachetools google.protobuf tornado altair
-    git PIL requests rich tenacity toml watchdog validators
-    anyio itsdangerous multipart starlette uvicorn websockets httptools
-    yt_dlp youtube_transcript_api
+    streamlit rich requests yt_dlp youtube_transcript_api
 )
 MISSING=()
 for mod in "${VERIFY_MODULES[@]}"; do
@@ -102,19 +120,15 @@ done
 echo ""
 echo "================================================================"
 if [ ${#MISSING[@]} -eq 0 ]; then
-    echo "  ✅ INSTALL SELESAI — semua modul terverifikasi bisa di-import!"
+    echo "  ✅ INSTALL SELESAI — semua modul inti terverifikasi!"
 else
-    echo "  ⚠️  INSTALL SELESAI DENGAN CATATAN"
-    echo "  Modul berikut BELUM bisa di-import: ${MISSING[*]}"
-    echo "  streamlit run kemungkinan masih error ModuleNotFoundError."
+    echo "  ⚠️  Modul berikut BELUM bisa di-import: ${MISSING[*]}"
     echo "  Coba: pip install <nama_modul> --break-system-packages"
-    echo "  (nama modul Python kadang beda dari nama paket pip, misal"
-    echo "   'google.protobuf' itu dari paket 'protobuf', 'PIL' dari 'pillow')"
 fi
 echo "================================================================"
 echo ""
 echo "  Jalankan dengan:"
-echo "    streamlit run cs20_ui.py"
+echo "    streamlit run cs20_ui.py --server.address 0.0.0.0"
 echo ""
 echo "  Atau setup config dulu:"
 echo "    cp config_sample.json config.json"
