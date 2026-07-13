@@ -101,6 +101,19 @@ def check_config() -> dict | None:
     return cfg if has_valid else None
 
 
+def get_cfg(force_recheck: bool = False) -> dict | None:
+    """Config di-cache di session_state sekali per sesi, BUKAN di-baca ulang
+    dari disk di setiap rerun. Ini mencegah interaksi widget yang sama sekali
+    tidak berhubungan dengan config (mis. hapus channel di antrian) tiba-tiba
+    melempar balik ke gate setup gara-gara flakiness baca file sesaat.
+    Dipanggil ulang secara eksplisit (force_recheck=True) hanya setelah
+    save/upload config baru di halaman Settings.
+    """
+    if force_recheck or "cfg_cache" not in st.session_state:
+        st.session_state.cfg_cache = check_config()
+    return st.session_state.cfg_cache
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # CHANNEL VALIDATION (diadaptasi dari cs20_ui.py, poin 10 catatan lanjutan)
 # ══════════════════════════════════════════════════════════════════════════
@@ -752,7 +765,7 @@ def page_chat(cfg: dict):
 def main():
     st.set_page_config(page_title="Cegukan Seeker V20 — Web UI", page_icon="👑", layout="wide")
 
-    cfg = check_config()
+    cfg = get_cfg()
 
     with st.sidebar:
         st.markdown("## 👑 Cegukan Seeker V20")
