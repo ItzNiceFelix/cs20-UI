@@ -63,6 +63,20 @@ except ImportError:
     sys.exit(1)
 
 # ==============================================================================
+# JSON EVENTS (untuk Web UI / Streamlit) — konsisten dengan cs20_index_engine.py
+# dan cs20_age_engine.py. Saat --json-events aktif, engine print event JSON
+# per baris (prefix "CS20JSON:") ke stdout, TANPA mengubah perilaku CLI biasa.
+# ==============================================================================
+JSON_MODE: bool = False
+
+def _emit_json(event_type: str, payload: dict):
+    line = {"type": event_type, **payload}
+    print("CS20JSON:" + json.dumps(line, ensure_ascii=False), flush=True)
+
+# Cache judul video, diisi gratis bareng fetch ID (yt-dlp --print id|||title)
+_VIDEO_TITLES: dict = {}
+
+# ==============================================================================
 # WARNA TERMINAL
 # ==============================================================================
 class C:
@@ -493,11 +507,14 @@ def get_video_ids(channel: str, limit: int, content_type: str) -> list:
 
 
 def _fetch_ids(url: str, limit: int, extra_args: list) -> list:
-    """Helper: jalankan yt-dlp flat-playlist dan return list ID."""
+    """Helper: jalankan yt-dlp flat-playlist dan return list ID.
+    Sekalian ambil judul (format id|||title) dalam satu request yang sama —
+    tidak menambah request/rate-limit risk. Judul di-cache ke _VIDEO_TITLES.
+    """
     cmd = [
         "yt-dlp",
         "--flat-playlist",
-        "--print", "id",
+        "--print", "%(id)s|||%(title)s",
         "--playlist-end", str(limit),
         *extra_args,
         "--quiet",
@@ -507,9 +524,18 @@ def _fetch_ids(url: str, limit: int, extra_args: list) -> list:
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         seen, unique = set(), []
-        for vid in ids:
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split("|||", 1)
+            vid = parts[0].strip()
+            title = parts[1].strip() if len(parts) > 1 else ""
+            if not vid:
+                continue
+            if title:
+                _VIDEO_TITLES[vid] = title
             if vid not in seen:
                 seen.add(vid)
                 unique.append(vid)
@@ -626,6 +652,7 @@ def analyze_video(video_id: str, channel: str) -> dict:
     base_result = {
         "video_id": video_id,
         "channel": channel,
+        "title": _VIDEO_TITLES.get(video_id, video_id),
         "status": "no_transcript",
         "status_label": "🚫 Tanpa Transkrip",
         "hits": [],
@@ -1530,6 +1557,26 @@ def run_display_pantau(channel, video_ids, worker_fn, checkpoint_info: dict, web
                 layout["progress"].update(progress)
                 live.refresh()
 
+                if JSON_MODE:
+                    _emit_json("progress", {
+                        "phase": "pantau", "channel": channel,
+                        "done": done, "total": _stats["total"],
+                        "hits_total": _stats["hits_total"],
+                    })
+                    if result.get("hits"):
+                        _emit_json("match", {
+                            "channel": channel,
+                            "video_id": result["video_id"],
+                            "title": result.get("title", result["video_id"]),
+                            "transcript_lang": result.get("transcript_lang", ""),
+                            "tier_counts": result.get("tier_counts"),
+                            "persentase": result.get("persentase"),
+                            "hits": [
+                                {"time": h["time"], "text": h["text"], "tiers": h["tiers"], "url": h["url"]}
+                                for h in result["hits"]
+                            ],
+                        })
+
                 # ── Hype moment ────────────────────────────────────
                 if kasta in ("GOD_MODE", "VALID_HIGH"):
                     _hype_events.append(result)
@@ -1559,6 +1606,10 @@ def run_display_pantau(channel, video_ids, worker_fn, checkpoint_info: dict, web
                         checkpoint_info["start_from"] + done, checkpoint_info["total"]
                     )
                     _kirim_laporan_darurat("rate limit darurat")
+                    if JSON_MODE:
+                        _emit_json("rate_limit_stop", {
+                            "channel": channel, "done": done, "total": _stats["total"],
+                        })
                     if live_active:
                         live.stop()
                         live_active = False
@@ -2433,6 +2484,9 @@ def process_channel(args):
 
     send_discord(webhook_url, channel, executor, results, html_path)
 
+    if JSON_MODE:
+        _emit_json("report_sent", {"channel": channel, "html_path": html_path})
+
     # Hapus HTML lokal hanya jika ukurannya aman dan sudah terkirim
     # Jika terlalu besar atau forbidden, file dibiarkan untuk akses manual
     if os.path.exists(html_path):
@@ -2514,6 +2568,11 @@ if __name__ == "__main__":
     parser.add_argument("--webhook-url",   default="")
     parser.add_argument("--lang",               default="id")
     parser.add_argument("--retry-blocked-log",  default="")
+    parser.add_argument("--json-events", action="store_true",
+                         help="Print event JSON (prefix CS20JSON:) buat konsumsi Web UI. "
+                              "Tanpa flag ini, perilaku 100% sama seperti sebelumnya.")
 
     args = parser.parse_args()
+    if args.json_events:
+        JSON_MODE = True
     process_channel(args)
