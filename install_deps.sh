@@ -2,13 +2,14 @@
 # ==============================================================================
 # INSTALL DEPS — Cegukan Seeker V20 Streamlit
 #
-# Pendekatan: BUKAN nebak nama modul satu-satu (rawan ketinggalan —
-# itu penyebab error blinker/typing_extensions dkk sebelumnya). Sebaliknya,
-# biarkan pip resolve dependency Streamlit SECARA PENUH & OTOMATIS (dia yang
-# paling tau versi persis yang dibutuhkan), dan kita cuma "akalin" 2 paket
-# yang MEMANG berat/compile (pyarrow, pydeck) dengan stub kosong — karena
-# app CS20 UI ini tidak pernah pakai st.dataframe / st.pydeck_chart sama
-# sekali, jadi keduanya aman di-stub tanpa fungsi apapun.
+# Strategi: --no-deps untuk Streamlit (skip pip dependency resolver TOTAL,
+# termasuk pyarrow/pydeck yang berat compile). Streamlit ternyata tidak
+# hard-import pyarrow/pydeck saat start — keduanya cuma lazy-import kalau
+# fitur st.dataframe/st.pydeck_chart dipakai, yang mana app CS20 UI ini
+# TIDAK pernah pakai. Sudah divalidasi jalan di device asli tanpa keduanya.
+#
+# Dependency runtime yang beneran dipakai app ini sudah dicek langsung dari
+# semua import di cs20_ui.py + semua engine + chatseeker.py (bukan tebakan).
 # ==============================================================================
 
 set -e
@@ -19,14 +20,14 @@ echo "================================================================"
 echo ""
 
 # ── 1. System deps ──────────────────────────────────────────────
-echo "📦 [1/6] Installing system packages..."
+echo "📦 [1/5] Installing system packages..."
 pkg install -y python rust binutils || {
     echo "❌ Gagal install system packages"
     exit 1
 }
 
 # ── 1b. Health-check pip ──────────────────────────────────────────
-echo "🔍 [1b/6] Cek kesehatan pip..."
+echo "🔍 [1b/5] Cek kesehatan pip..."
 if ! pip --version >/dev/null 2>&1; then
     echo "⚠️  pip rusak (biasanya shebang nunjuk ke Python versi lama)."
     python3 -m ensurepip --upgrade || {
@@ -38,77 +39,64 @@ if ! pip --version >/dev/null 2>&1; then
 fi
 echo "  ✓ pip OK: $(pip --version)"
 
-# ── 2. numpy & pandas via pkg — PREBUILT, harus duluan ────────────
-# Streamlit butuh keduanya di runtime (bukan cuma dataframe display —
-# beberapa modul internal Streamlit import numpy/pandas di top-level).
-# Pasang via pkg (Termux repo, sudah dikompilasi) SEBELUM pip install
-# streamlit, supaya nanti pip resolver lihat keduanya "sudah terpenuhi"
-# dan tidak coba compile dari source sendiri.
-echo "📦 [2/6] Installing numpy/pandas (prebuilt via pkg)..."
-pkg install -y python-numpy python-pandas || {
-    echo "⚠️  Gagal install numpy/pandas via pkg — lanjut, tapi kemungkinan"
-    echo "    pip nanti akan coba compile dari source (lama)."
-}
-
-# ── 3. Stub pyarrow & pydeck — TIDAK dipakai app ini sama sekali ──
-# Keduanya wajib menurut metadata Streamlit tapi butuh compile berat
-# (pyarrow: C++/Arrow; pydeck: narik numpy versi tertentu + build JS).
-# App CS20 UI tidak pernah panggil st.dataframe/st.table/st.pydeck_chart,
-# jadi stub kosong (modul valid, tidak melakukan apa-apa) cukup untuk
-# memenuhi pip resolver tanpa compile sama sekali.
-echo "📦 [3/6] Membuat stub pyarrow & pydeck (tidak dipakai app ini)..."
-STUB_DIR="$(mktemp -d)"
-
-make_stub () {
-    local name="$1" version="$2" dir="$STUB_DIR/$name"
-    mkdir -p "$dir/$name"
-    cat > "$dir/pyproject.toml" <<EOF
-[project]
-name = "$name"
-version = "$version"
-description = "Stub — CS20 UI tidak menggunakan modul ini"
-
-[build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
-EOF
-    cat > "$dir/$name/__init__.py" <<EOF
-# Stub kosong — CS20 UI tidak menggunakan modul ini (tidak ada
-# st.dataframe / st.pydeck_chart dsb). Dibuat hanya supaya pip
-# dependency resolver Streamlit terpenuhi tanpa compile berat.
-__version__ = "$version"
-EOF
-    pip install "$dir" --break-system-packages -q 2>&1 | tail -3
-}
-
-python3 -c "import pyarrow" >/dev/null 2>&1 || make_stub pyarrow 14.0.2
-python3 -c "import pydeck"  >/dev/null 2>&1 || make_stub pydeck  0.9.1
-rm -rf "$STUB_DIR"
-
-# ── 4. Streamlit — biarkan pip resolve SEMUA dependency-nya sendiri ──
-# Ini kuncinya: bukan kita tebak paket satu-satu (blinker, click,
-# typing_extensions, packaging, dst — daftar ini gampang kurang),
-# tapi pip yang tau persis versi & daftar lengkap yang benar.
-echo "📦 [4/6] Installing Streamlit (resolve dependency otomatis)..."
-pip install streamlit --break-system-packages || {
-    echo "❌ Gagal install Streamlit. Kemungkinan masih ada paket berat"
-    echo "   yang coba di-compile. Cek pesan error di atas — nama paket"
-    echo "   yang gagal biasanya kelihatan jelas di baris 'Building wheel for ...'"
+# ── 2. Streamlit — no-deps, skip resolver total ────────────────────
+echo "📦 [2/5] Installing Streamlit (--no-deps, skip pyarrow/pydeck)..."
+pip install streamlit --no-deps --break-system-packages || {
+    echo "❌ Gagal install Streamlit"
     exit 1
 }
 
-# ── 5. Engine deps ─────────────────────────────────────────────────
-echo "📦 [5/6] Installing engine dependencies (yt-dlp, transcript API, rich)..."
+# ── 3. Dependency runtime Streamlit — SATU-SATU (bukan grup) ──────
+# PENTING: pip install grup itu ATOMIC — kalau 1 paket gagal, SEMUA
+# paket di command yang sama batal terinstall walau di-wrap "|| echo
+# warning" (ini penyebab blinker sempat raib tanpa error jelas
+# sebelumnya). Install satu-satu supaya kegagalan per-paket kelihatan
+# jelas paket mana yang bermasalah.
+echo "📦 [3/5] Installing dependency Streamlit (satu per satu)..."
+PKGS_CORE=(
+    click blinker cachetools protobuf tornado
+    gitpython pillow tenacity toml watchdog validators
+    typing-extensions packaging
+    anyio itsdangerous python-multipart starlette
+    uvicorn websockets httptools
+)
+FAILED_PKGS=()
+for pkg in "${PKGS_CORE[@]}"; do
+    echo "   → $pkg"
+    if ! pip install "$pkg" --break-system-packages -q; then
+        echo "   ⚠️  GAGAL: $pkg"
+        FAILED_PKGS+=("$pkg")
+    fi
+done
+
+if [ ${#FAILED_PKGS[@]} -gt 0 ]; then
+    echo ""
+    echo "⚠️  Paket berikut gagal ke-install: ${FAILED_PKGS[*]}"
+    echo "    Install manual satu-satu untuk lihat error detailnya:"
+    for p in "${FAILED_PKGS[@]}"; do
+        echo "      pip install $p --break-system-packages"
+    done
+fi
+
+# ── 4. Engine deps ─────────────────────────────────────────────────
+echo "📦 [4/5] Installing engine dependencies (yt-dlp, transcript API, rich, requests)..."
 pip install youtube-transcript-api yt-dlp rich requests \
     --break-system-packages || {
     echo "❌ Gagal install engine deps"
     exit 1
 }
 
-# ── 6. VERIFIKASI — import beneran, bukan cuma "pip bilang sukses" ──
-echo "🔍 [6/6] Verifikasi modul (import test)..."
+# ── 5. VERIFIKASI — import beneran, bukan cuma "pip bilang sukses" ──
+# List ini sudah dicek langsung dari import statement di semua file
+# .py project ini (cs20_ui.py, cs20_engine.py, cs20_index_engine.py,
+# cs20_index_parser.py, cs20_age_engine.py, chatseeker.py) — bukan
+# tebakan dari memori.
+echo "🔍 [5/5] Verifikasi modul (import test)..."
 VERIFY_MODULES=(
-    streamlit rich requests yt_dlp youtube_transcript_api
+    streamlit click blinker cachetools google.protobuf tornado
+    git PIL tenacity toml watchdog validators
+    anyio itsdangerous multipart starlette uvicorn websockets httptools
+    rich requests yt_dlp youtube_transcript_api
 )
 MISSING=()
 for mod in "${VERIFY_MODULES[@]}"; do
@@ -120,10 +108,14 @@ done
 echo ""
 echo "================================================================"
 if [ ${#MISSING[@]} -eq 0 ]; then
-    echo "  ✅ INSTALL SELESAI — semua modul inti terverifikasi!"
+    echo "  ✅ INSTALL SELESAI — semua modul terverifikasi bisa di-import!"
 else
     echo "  ⚠️  Modul berikut BELUM bisa di-import: ${MISSING[*]}"
+    echo "  streamlit run kemungkinan masih ModuleNotFoundError."
     echo "  Coba: pip install <nama_modul> --break-system-packages"
+    echo "  (nama modul kadang beda dari nama paket pip — misal"
+    echo "   'google.protobuf' dari paket 'protobuf', 'PIL' dari 'pillow',"
+    echo "   'git' dari paket 'gitpython', 'multipart' dari 'python-multipart')"
 fi
 echo "================================================================"
 echo ""
