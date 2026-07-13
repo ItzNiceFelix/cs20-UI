@@ -6,8 +6,26 @@ Age Bypass, dan Settings, mengadaptasi bagian terbaik dari cs20_ui.py (Kimi).
 Semua mode dijalankan sebagai subprocess engine dengan --json-events, dan
 diparsing lewat run_engine_live() generik (pola konsisten, bukan import
 langsung seperti versi Kimi yang lama).
+
+CHANGELOG (audit fix):
+- Fix: cfg_cache tidak pernah di-invalidate setelah save_config() -> user
+  kelihatan "ke-reset" ke gate setup padahal file sudah tersimpan benar.
+- Fix: antrian channel & hasil scan sekarang dipersist ke disk (queue.json)
+  supaya tidak hilang total kalau browser reload di tengah throttle/cooldown.
+- Fix: escape semua field dari data eksternal (judul video, teks transcript,
+  channel, url) sebelum di-render sebagai HTML mentah -> cegah broken layout
+  / HTML-injection dari data YouTube.
+- Fix: tidak ada opsi "sesi baru" setelah scan selesai -> sekarang ada tombol
+  "Mulai Sesi Baru" yang wajib ditekan sebelum bisa scan ulang.
+- Fix: hapus form edit config manual sepenuhnya -> config HANYA masuk lewat
+  upload config.json (satu sumber kebenaran, tidak ada webhook manual yang
+  tidak divalidasi ulang).
+- Fix: navigasi utama pindah dari sidebar-button ke st.tabs() di area utama
+  -> di Android, sidebar collapsed sering bikin menu "hilang". Tabs selalu
+  penuh terlihat baik di desktop maupun mobile.
 """
 
+import html
 import json
 import os
 import re
@@ -26,6 +44,7 @@ CONFIG_DIR     = os.path.join(SCRIPT_DIR, ".cs20")
 CHECKPOINT_DIR = os.path.join(CONFIG_DIR, "checkpoints")
 CONFIG_JSON    = os.path.join(SCRIPT_DIR, "config.json")
 COOKIES_PATH   = os.path.join(CONFIG_DIR, "cookies.txt")
+QUEUE_JSON     = os.path.join(CONFIG_DIR, "queue.json")
 
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
@@ -67,7 +86,7 @@ os.makedirs(CHECKPOINT_DIR_CHAT, exist_ok=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# CONFIG SYSTEM (webhook.json) — via upload, bukan form manual
+# CONFIG SYSTEM (webhook.json) — HANYA via upload, tidak ada edit manual
 # ══════════════════════════════════════════════════════════════════════════
 def load_config() -> dict | None:
     if not os.path.exists(CONFIG_JSON):
@@ -86,7 +105,11 @@ def save_config(cfg: dict):
 
 
 def validate_webhook(url: str) -> bool:
-    return bool(re.match(r'^https://discord\.com/api/webhooks/\d+/[\w-]+$', url.strip()))
+    # Terima discord.com & legacy discordapp.com, boleh ada query string (?wait=true dll).
+    return bool(re.match(
+        r'^https://(discord|discordapp)\.com/api/webhooks/\d+/[\w-]+(\?.*)?$',
+        url.strip()
+    ))
 
 
 def check_config() -> dict | None:
@@ -106,12 +129,42 @@ def get_cfg(force_recheck: bool = False) -> dict | None:
     dari disk di setiap rerun. Ini mencegah interaksi widget yang sama sekali
     tidak berhubungan dengan config (mis. hapus channel di antrian) tiba-tiba
     melempar balik ke gate setup gara-gara flakiness baca file sesaat.
-    Dipanggil ulang secara eksplisit (force_recheck=True) hanya setelah
-    save/upload config baru di halaman Settings.
+
+    PENTING: dipanggil ulang secara eksplisit (force_recheck=True) SETIAP kali
+    setelah save_config() dipanggil (upload config baru), supaya cache tidak
+    "nyangkut" ke nilai lama (bug lama: user isi config, ke-save benar ke
+    disk, tapi UI tetap balik ke gate setup karena cache tidak di-refresh).
     """
     if force_recheck or "cfg_cache" not in st.session_state:
         st.session_state.cfg_cache = check_config()
     return st.session_state.cfg_cache
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# PERSISTENSI ANTRIAN CHANNEL (queue.json) — supaya tidak hilang saat reload
+# ══════════════════════════════════════════════════════════════════════════
+def load_queue() -> list:
+    if not os.path.exists(QUEUE_JSON):
+        return []
+    try:
+        with open(QUEUE_JSON, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_queue(channels: list):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    try:
+        with open(QUEUE_JSON, "w", encoding="utf-8") as f:
+            json.dump(channels, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass  # gagal simpan antrian bukan fatal, cukup diamkan
+
+
+def clear_queue():
+    st.session_state.channels = []
+    save_queue([])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -185,11 +238,13 @@ def validate_channel(channel: str, content_type: str = "all") -> dict:
 DEFAULTS = {
     "page": "search",
     "theme": "dark",
-    "channels": [],
+    "channels": None,          # diisi dari queue.json di awal main()
     "running": False,
+    "session_done": False,     # True setelah 1 sesi scan selesai -> gate "Sesi Baru"
     "index_running": False,
     "age_running": False,
     "chat_running": False,
+    "search_results_tmp": [],
     "index_results": [],
     "age_results": [],
     "chat_results": [],
@@ -198,6 +253,11 @@ DEFAULTS = {
 for k, v in DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# Load antrian channel dari disk hanya sekali di awal sesi (bukan tiap rerun,
+# supaya perubahan di memory sesi berjalan tidak ketimpa balik oleh file lama).
+if st.session_state.channels is None:
+    st.session_state.channels = load_queue()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -237,13 +297,40 @@ def inject_theme_css(theme: str):
             display: inline-block; padding: 1px 8px; border-radius: 6px;
             font-size: 0.72rem; font-weight: 700; background: #34495e; color: white;
         }}
+        /* Mobile-friendly tab nav: wrap & perkecil font supaya tidak
+           terpotong/overflow di layar sempit (Android). */
+        .stTabs [data-baseweb="tab-list"] {{
+            flex-wrap: wrap;
+            gap: 4px;
+        }}
+        .stTabs [data-baseweb="tab"] {{
+            font-size: 0.85rem;
+            padding: 6px 10px;
+            white-space: nowrap;
+        }}
     </style>
     """, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# RESULT CARD (badge tier + border kasta digabung)
+# RESULT CARD (badge tier + border kasta digabung) — semua field eksternal
+# di-escape dulu sebelum masuk HTML, cegah broken layout / injection.
 # ══════════════════════════════════════════════════════════════════════════
+def _safe(val, default="") -> str:
+    """Escape apa pun yang berasal dari data eksternal (judul video, channel,
+    teks transcript/chat) sebelum di-render sebagai HTML mentah."""
+    return html.escape(str(val if val not in (None, "") else default))
+
+
+def _safe_url(url: str) -> str:
+    """Hanya izinkan URL yang benar-benar mengarah ke YouTube. Selain itu,
+    kembalikan '#' supaya tidak ada href yang bisa disuntik dari data luar."""
+    url = str(url or "")
+    if url.startswith("https://www.youtube.com/") or url.startswith("https://youtu.be/"):
+        return html.escape(url, quote=True)
+    return "#"
+
+
 def render_match_card(container, ev: dict):
     kasta = ev.get("kasta", "")
     border = KASTA_BORDER.get(kasta, KASTA_DEFAULT_BORDER)
@@ -258,11 +345,11 @@ def render_match_card(container, ev: dict):
         cnt = tc.get(tier, 0)
         if cnt:
             color = TIER_COLORS.get(tier, "#888")
-            badges_html += f'<span class="cs20-badge" style="background:{color}">{tier} ×{cnt}</span>'
+            badges_html += f'<span class="cs20-badge" style="background:{color}">{_safe(tier)} ×{int(cnt)}</span>'
 
-    score_line = f"skor: {ev.get('persentase', 0)}%"
+    score_line = f"skor: {_safe(ev.get('persentase', 0))}%"
     if level:
-        score_line = f"{LEVEL_LABELS.get(level, f'LVL{level}')} · skor chat: {ev.get('score', 0)}"
+        score_line = f"{_safe(LEVEL_LABELS.get(level, f'LVL{level}'))} · skor chat: {_safe(ev.get('score', 0))}"
 
     lang_tag = ev.get("transcript_lang", "") or "?"
     hits_html = ""
@@ -271,23 +358,23 @@ def render_match_card(container, ev: dict):
         color = TIER_COLORS.get(top_tier, LEVEL_COLORS.get(level, "#555")) if not level else LEVEL_COLORS.get(level, "#555")
         hits_html += (
             f'<div class="cs20-hit" style="border-left-color:{color}">'
-            f'⏱ <b>{h["time"]}</b> — {h["text"]} '
-            f'<a href="{h["url"]}" target="_blank">↗ buka</a></div>'
+            f'⏱ <b>{_safe(h.get("time"))}</b> — {_safe(h.get("text"))} '
+            f'<a href="{_safe_url(h.get("url"))}" target="_blank" rel="noopener noreferrer">↗ buka</a></div>'
         )
 
-    lang_badge = f'<span class="cs20-lang-badge">{lang_tag.upper()}</span>&nbsp; ' if not level else ""
+    lang_badge = f'<span class="cs20-lang-badge">{_safe(lang_tag).upper()}</span>&nbsp; ' if not level else ""
 
-    html = f"""
+    html_out = f"""
     <div class="cs20-card" style="border-left-color:{border}">
-      <div class="cs20-title">📹 {ev.get('title','(tanpa judul)')}</div>
+      <div class="cs20-title">📹 {_safe(ev.get('title'), '(tanpa judul)')}</div>
       <div class="cs20-sub">
-        {lang_badge}@{ev.get('channel','')} &nbsp;|&nbsp; {score_line}
+        {lang_badge}@{_safe(ev.get('channel'))} &nbsp;|&nbsp; {score_line}
         &nbsp; {badges_html}
       </div>
       {hits_html}
     </div>
     """
-    container.markdown(html, unsafe_allow_html=True)
+    container.markdown(html_out, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -305,91 +392,107 @@ def run_engine_live(cmd: list, results_key: str, label_prefix: str = ""):
     report_placeholder   = st.empty()
     results_container     = st.container()
 
-    proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1, cwd=SCRIPT_DIR,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, cwd=SCRIPT_DIR,
+        )
+    except FileNotFoundError as e:
+        st.error(f"❌ Gagal menjalankan engine: `{e}`. Cek apakah file engine ada di direktori script.")
+        return st.session_state[results_key]
+    except Exception as e:
+        st.error(f"❌ Gagal menjalankan engine: {e}")
+        return st.session_state[results_key]
 
     raw_log_lines = []
 
-    for raw_line in proc.stdout:
-        line = raw_line.rstrip("\n")
-        if not line.startswith("CS20JSON:"):
-            raw_log_lines.append(line)
-            continue
+    try:
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            if not line.startswith("CS20JSON:"):
+                raw_log_lines.append(line)
+                continue
+            try:
+                ev = json.loads(line[len("CS20JSON:"):])
+            except json.JSONDecodeError:
+                continue
+
+            etype = ev.get("type")
+
+            if etype == "progress":
+                done, total = ev.get("done", 0), ev.get("total", 1) or 1
+                pct = int(min(done / total, 1.0) * 100)
+                phase = ev.get("phase", "")
+                batch = ev.get("batch")
+                batch_str = f" batch {batch}" if batch else ""
+                progress_placeholder.progress(
+                    pct, text=f"{label_prefix}@{ev.get('channel','')}{batch_str} "
+                              f"[{phase}] — {done}/{total} ({ev.get('hits_total', ev.get('an_hits', 0))} hit)"
+                )
+
+            elif etype == "batch_start":
+                status_placeholder.info(f"📦 Mulai batch {ev.get('batch')} / {ev.get('total_batches')} "
+                                         f"untuk @{ev.get('channel','')}")
+
+            elif etype == "batch_done":
+                status_placeholder.success(f"✅ Batch {ev.get('batch')} selesai ({ev.get('status')}).")
+
+            elif etype == "match":
+                slot = results_container.empty()
+                render_match_card(slot, ev)
+                st.session_state[results_key].append(ev)
+
+            elif etype == "report_sent":
+                report_placeholder.success(f"📨 Laporan @{ev.get('channel','')} terkirim ke Discord.")
+
+            elif etype == "rate_limit_stop":
+                status_placeholder.warning(f"⏸️ Rate limit — @{ev.get('channel','')} dihentikan darurat.")
+
+            elif etype == "cooldown":
+                status_placeholder.warning(f"⏸️ Rate limit beruntun — cooldown {ev.get('seconds',0)}s...")
+
+            elif etype == "all_done":
+                status_placeholder.success(f"🏁 @{ev.get('channel','')} selesai.")
+    except Exception as e:
+        st.error(f"❌ Terjadi error saat membaca output engine: {e}")
         try:
-            ev = json.loads(line[len("CS20JSON:"):])
-        except json.JSONDecodeError:
-            continue
-
-        etype = ev.get("type")
-
-        if etype == "progress":
-            done, total = ev.get("done", 0), ev.get("total", 1) or 1
-            pct = int(min(done / total, 1.0) * 100)
-            phase = ev.get("phase", "")
-            batch = ev.get("batch")
-            batch_str = f" batch {batch}" if batch else ""
-            progress_placeholder.progress(
-                pct, text=f"{label_prefix}@{ev.get('channel','')}{batch_str} "
-                          f"[{phase}] — {done}/{total} ({ev.get('hits_total', ev.get('an_hits', 0))} hit)"
-            )
-
-        elif etype == "batch_start":
-            status_placeholder.info(f"📦 Mulai batch {ev.get('batch')} / {ev.get('total_batches')} "
-                                     f"untuk @{ev.get('channel','')}")
-
-        elif etype == "batch_done":
-            status_placeholder.success(f"✅ Batch {ev.get('batch')} selesai ({ev.get('status')}).")
-
-        elif etype == "match":
-            slot = results_container.empty()
-            render_match_card(slot, ev)
-            st.session_state[results_key].append(ev)
-
-        elif etype == "report_sent":
-            report_placeholder.success(f"📨 Laporan @{ev.get('channel','')} terkirim ke Discord.")
-
-        elif etype == "rate_limit_stop":
-            status_placeholder.warning(f"⏸️ Rate limit — @{ev.get('channel','')} dihentikan darurat.")
-
-        elif etype == "cooldown":
-            status_placeholder.warning(f"⏸️ Rate limit beruntun — cooldown {ev.get('seconds',0)}s...")
-
-        elif etype == "all_done":
-            status_placeholder.success(f"🏁 @{ev.get('channel','')} selesai.")
+            proc.kill()
+        except Exception:
+            pass
 
     proc.wait()
     progress_placeholder.empty()
 
-    if proc.returncode != 0 and raw_log_lines:
-        with st.expander("⚠️ Log mentah (ada kemungkinan error, klik untuk lihat)"):
+    # Log mentah tetap ditampilkan meski returncode == 0, supaya warning
+    # non-fatal (mis. dari yt-dlp) tidak hilang begitu saja dari pandangan user.
+    if raw_log_lines:
+        label = "⚠️ Log mentah (ada kemungkinan error, klik untuk lihat)" if proc.returncode != 0 \
+            else "📄 Log mentah (klik untuk lihat detail proses)"
+        with st.expander(label):
             st.code("\n".join(raw_log_lines[-60:]), language="text")
 
     return st.session_state[results_key]
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# PAGE: SETUP / SETTINGS (config via upload)
+# PAGE: SETUP / SETTINGS (config HANYA via upload config.json)
 # ══════════════════════════════════════════════════════════════════════════
 def page_setup(gate: bool = False):
     if gate:
         st.markdown("## 🔐 Setup Wajib")
-        st.caption("Config webhook Discord belum ditemukan/valid. Upload atau isi manual dulu di bawah.")
+        st.caption("Config webhook Discord belum ditemukan/valid. Upload `config.json` dulu di bawah.")
     else:
         st.markdown("## ⚙️ Settings")
 
-    cfg = load_config() or {"webhooks": {}, "executor": ""}
-
-    tab_upload, tab_manual, tab_cookies = st.tabs(
-        ["📤 Upload config.json", "✏️ Edit Manual", "🍪 Cookies"]
-    )
+    tab_upload, tab_cookies = st.tabs(["📤 Upload config.json", "🍪 Cookies"])
 
     with tab_upload:
         st.subheader("Upload file config.json")
         st.caption(
-            "Cara tercepat: upload `config.json` yang sudah pernah kamu isi "
-            "(mis. dari sesi Termux lain). Format:"
+            "Config webhook **HANYA** bisa diisi lewat upload file — tidak ada form edit "
+            "manual di web ini (mencegah webhook salah ketik/kepencet tanpa sadar). "
+            "Upload `config.json` yang sudah pernah kamu isi (mis. dari sesi Termux lain), "
+            "atau buat baru dengan format:"
         )
         st.code("""{
   "webhooks": {
@@ -407,10 +510,14 @@ def page_setup(gate: bool = False):
                 valid_hooks = {k: v for k, v in webhooks.items()
                                if v and validate_webhook(v)}
                 if not valid_hooks:
-                    st.error("❌ File terbaca tapi tidak ada webhook valid di dalamnya.")
+                    st.error(
+                        "❌ File terbaca tapi tidak ada webhook valid di dalamnya. "
+                        "Pastikan URL berformat `https://discord.com/api/webhooks/<id>/<token>`."
+                    )
                 else:
                     parsed["webhooks"] = valid_hooks
                     save_config(parsed)
+                    get_cfg(force_recheck=True)  # <-- fix: invalidate cache supaya tidak "balik ke gate"
                     st.success(f"✅ Config tersimpan! ({len(valid_hooks)} webhook valid terdeteksi)")
                     time.sleep(1)
                     st.rerun()
@@ -423,35 +530,8 @@ def page_setup(gate: bool = False):
             with open(CONFIG_JSON, "rb") as f:
                 st.download_button("⬇️ Download config.json saat ini", f.read(),
                                     "config.json", mime="application/json")
-
-    with tab_manual:
-        st.subheader("Isi Webhook Manual")
-        webhooks = cfg.get("webhooks", {})
-        cols = st.columns(2)
-        with cols[0]:
-            id_url = st.text_input("🇮🇩 Indonesia (ID)", webhooks.get("id", ""))
-            en_url = st.text_input("🇬🇧 English (EN)", webhooks.get("en", ""))
-            jp_url = st.text_input("🇯🇵 Japanese (JP)", webhooks.get("jp", ""))
-        with cols[1]:
-            kr_url = st.text_input("🇰🇷 Korean (KR)", webhooks.get("kr", ""))
-            in_url = st.text_input("🇮🇳 India (IN)", webhooks.get("in", ""))
-
-        executor_name = st.text_input("👤 Nama alias (buat laporan Discord)",
-                                       cfg.get("executor", ""))
-
-        if st.button("💾 Simpan Config", type="primary", use_container_width=True):
-            new_hooks = {}
-            for name, url in [("id", id_url), ("en", en_url), ("jp", jp_url),
-                               ("kr", kr_url), ("in", in_url)]:
-                if url.strip() and validate_webhook(url.strip()):
-                    new_hooks[name] = url.strip()
-            if not new_hooks:
-                st.error("❌ Minimal 1 webhook valid harus diisi!")
-            else:
-                save_config({"webhooks": new_hooks, "executor": executor_name.strip()})
-                st.success("✅ Config tersimpan!")
-                time.sleep(1)
-                st.rerun()
+        else:
+            st.caption("Belum ada config.json tersimpan.")
 
     with tab_cookies:
         st.subheader("🍪 YouTube Cookies")
@@ -497,30 +577,42 @@ def page_search(cfg: dict):
 
         st.divider()
         st.markdown("### 📺 Tambah Channel")
-        new_handle = st.text_input("Username channel (tanpa @)", key="new_channel_input")
-        if st.button("➕ Tambah ke antrian", use_container_width=True, disabled=st.session_state.running):
-            if new_handle.strip():
-                with st.spinner(f"Memeriksa @{new_handle.strip()}..."):
-                    res = validate_channel(new_handle, content_type)
+        disabled_add = st.session_state.running or st.session_state.session_done
+        new_handle = st.text_input("Username channel (tanpa @)", key="new_channel_input",
+                                    disabled=disabled_add)
+        if st.button("➕ Tambah ke antrian", use_container_width=True, disabled=disabled_add):
+            handle_clean = new_handle.strip().lstrip("@")
+            if not handle_clean:
+                st.warning("⚠️ Isi username channel dulu.")
+            elif any(c["handle"].lower() == handle_clean.lower() for c in st.session_state.channels):
+                st.warning(f"⚠️ @{handle_clean} sudah ada di antrian.")
+            else:
+                with st.spinner(f"Memeriksa @{handle_clean}..."):
+                    res = validate_channel(handle_clean, content_type)
                 st.session_state.channels.append({
-                    "handle": new_handle.strip().lstrip("@"),
+                    "handle": handle_clean,
                     "name": res["name"],
                     "valid": res["valid"],
                     "error": res["error"],
                     "status": "queued",
                 })
+                save_queue(st.session_state.channels)
+                st.rerun()
 
         if st.session_state.channels:
             st.markdown("#### Antrian channel")
             for i, ch in enumerate(st.session_state.channels):
                 badge = "✅" if ch["valid"] else "❌"
+                status = ch.get("status", "queued")
+                status_icon = {"queued": "⏳", "done": "🏁", "running": "▶️"}.get(status, status)
                 label = ch["name"] if ch["valid"] else (ch["error"] or "invalid")
                 colc1, colc2 = st.columns([5, 1])
                 with colc1:
-                    st.write(f"{badge} **@{ch['handle']}** — {label}  `{ch.get('status','queued')}`")
+                    st.write(f"{badge} **@{ch['handle']}** — {label}  `{status_icon} {status}`")
                 with colc2:
                     if st.button("🗑", key=f"del_{i}", disabled=st.session_state.running):
                         st.session_state.channels.pop(i)
+                        save_queue(st.session_state.channels)
                         st.rerun()
 
     st.session_state.theme = st.radio("Tema", ["dark", "light"], horizontal=True,
@@ -528,16 +620,30 @@ def page_search(cfg: dict):
                                        key="theme_radio_search")
     inject_theme_css(st.session_state.theme)
 
+    # ── Gate: kalau sesi sebelumnya sudah selesai, wajib "Mulai Sesi Baru" dulu ──
+    if st.session_state.session_done:
+        st.success("🏁 Sesi scan sebelumnya sudah selesai.")
+        st.caption("Antrian channel & hasil scan sesi lalu masih ditampilkan di bawah untuk referensi.")
+        if st.button("🔄 Mulai Sesi Baru", type="primary", use_container_width=True):
+            clear_queue()
+            st.session_state.search_results_tmp = []
+            st.session_state.session_done = False
+            st.rerun()
+        st.divider()
+
     valid_channels = [c for c in st.session_state.channels if c["valid"]]
     executor = st.session_state.get("executor", "")
-    start_disabled = st.session_state.running or not valid_channels or not executor.strip()
+    start_disabled = (st.session_state.running or st.session_state.session_done
+                       or not valid_channels or not executor.strip())
 
     start_col, info_col = st.columns([1, 4])
     with start_col:
         start_clicked = st.button("▶️ Mulai Scan", type="primary", use_container_width=True,
                                    disabled=start_disabled)
     with info_col:
-        if not executor.strip():
+        if st.session_state.session_done:
+            st.caption("ℹ️ Tekan 'Mulai Sesi Baru' dulu di atas sebelum bisa scan lagi.")
+        elif not executor.strip():
             st.caption("⚠️ Isi nama alias dulu di sidebar.")
         elif not valid_channels:
             st.caption("⚠️ Tambahkan minimal 1 channel valid ke antrian (sidebar).")
@@ -547,6 +653,8 @@ def page_search(cfg: dict):
         webhook_url = cfg.get("webhooks", {}).get(lang_choice, "")
         total = len(valid_channels)
         for idx, ch in enumerate(valid_channels, start=1):
+            ch["status"] = "running"
+            save_queue(st.session_state.channels)
             st.markdown(f"#### 🔴 Channel {idx}/{total}: @{ch['handle']}")
             cmd = [
                 sys.executable, ENGINE_PANTAU,
@@ -563,8 +671,12 @@ def page_search(cfg: dict):
                 "--json-events",
             ]
             run_engine_live(cmd, "search_results_tmp", label_prefix="")
+            ch["status"] = "done"
+            save_queue(st.session_state.channels)
         st.session_state.running = False
+        st.session_state.session_done = True
         st.success("🏁 Semua channel di antrian selesai diproses.")
+        st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -582,15 +694,6 @@ def page_index(cfg: dict):
 
     channel = st.text_input("📺 Channel target", placeholder="nama_channel").strip().lstrip("@")
 
-    if channel and st.button("✅ Validasi Channel"):
-        with st.spinner("Validasi..."):
-            info = validate_channel(channel, "all")
-        if info["valid"]:
-            st.success(f"✅ **{info['name']}** | Video: {info['video_count']}{'+' if info['video_capped'] else ''} "
-                       f"| Live: {info['live_count']}{'+' if info['live_capped'] else ''}")
-        else:
-            st.error(f"❌ {info['error']}")
-
     st.subheader("⚙️ Konfigurasi Batch")
     col1, col2 = st.columns(2)
     with col1:
@@ -602,6 +705,15 @@ def page_index(cfg: dict):
                                      format_func=lambda k: CONTENT_TYPE_OPTIONS[k], key="idx_ct")
     lang_choice = st.selectbox("Bahasa engine", options=list(LANG_OPTIONS.keys()),
                                 format_func=lambda k: LANG_OPTIONS[k], key="idx_lang")
+
+    if channel and st.button("✅ Validasi Channel"):
+        with st.spinner("Validasi..."):
+            info = validate_channel(channel, content_type)  # fix: pakai content_type yg sama dgn run
+        if info["valid"]:
+            st.success(f"✅ **{info['name']}** | Video: {info['video_count']}{'+' if info['video_capped'] else ''} "
+                       f"| Live: {info['live_count']}{'+' if info['live_capped'] else ''}")
+        else:
+            st.error(f"❌ {info['error']}")
 
     total_batches = (total_videos + batch_size - 1) // batch_size
     st.caption(f"📦 {total_batches} batch total (~{batch_size} video/batch)")
@@ -760,50 +872,45 @@ def page_chat(cfg: dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# MAIN
+# MAIN — navigasi pakai st.tabs() di area utama, BUKAN sidebar button.
+# Alasan: di Android, sidebar Streamlit default collapsed dan ikon buka (>>)
+# gampang ke-cover / meleset di layar sempit -> menu "hilang". st.tabs()
+# selalu terlihat penuh baik di desktop maupun mobile.
 # ══════════════════════════════════════════════════════════════════════════
 def main():
-    st.set_page_config(page_title="Cegukan Seeker V20 — Web UI", page_icon="👑", layout="wide")
+    st.set_page_config(
+        page_title="Cegukan Seeker V20 — Web UI",
+        page_icon="👑",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
 
     cfg = get_cfg()
 
-    with st.sidebar:
-        st.markdown("## 👑 Cegukan Seeker V20")
-        st.divider()
-
     if not cfg:
         inject_theme_css(st.session_state.theme)
+        st.markdown("## 👑 Cegukan Seeker V20")
         page_setup(gate=True)
         return
 
-    with st.sidebar:
-        st.markdown("### 🧭 Navigasi")
-        pages = {
-            "search":   "🔍 Search Instant",
-            "index":    "📦 Index Mode",
-            "age":      "🔞 Age Bypass",
-            "chat":     "💬 ChatSeeker",
-            "settings": "⚙️ Settings",
-        }
-        for key, label in pages.items():
-            btn_type = "primary" if st.session_state.page == key else "secondary"
-            if st.button(label, key=f"nav_{key}", use_container_width=True, type=btn_type):
-                st.session_state.page = key
-                st.rerun()
+    st.markdown("## 👑 Cegukan Seeker V20")
 
-    page = st.session_state.page
-    if page == "search":
+    tab_search, tab_index, tab_age, tab_chat, tab_settings = st.tabs([
+        "🔍 Search Instant", "📦 Index Mode", "🔞 Age Bypass", "💬 ChatSeeker", "⚙️ Settings"
+    ])
+
+    with tab_search:
         page_search(cfg)
-    elif page == "index":
+    with tab_index:
         inject_theme_css(st.session_state.theme)
         page_index(cfg)
-    elif page == "age":
+    with tab_age:
         inject_theme_css(st.session_state.theme)
         page_age(cfg)
-    elif page == "chat":
+    with tab_chat:
         inject_theme_css(st.session_state.theme)
         page_chat(cfg)
-    elif page == "settings":
+    with tab_settings:
         inject_theme_css(st.session_state.theme)
         page_setup(gate=False)
 
